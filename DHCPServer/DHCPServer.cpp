@@ -48,7 +48,8 @@ namespace Plugin {
                         index.Current().PoolStart.Value(),
                         index.Current().PoolSize.Value(),
                         index.Current().Router.Value(),
-                        dns));
+                        dns,
+                        service->PersistentPath()));
             }
         }
 

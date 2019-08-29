@@ -146,7 +146,7 @@ namespace Plugin {
                 : _length(length)
             {
 
-                if (_length > sizeof(_id._buffer)) {
+                if (_length > maxLength) {
                     _id._allocation = new uint8_t[_length];
                     ::memcpy(_id._allocation, id, _length);
                 } else {
@@ -156,7 +156,7 @@ namespace Plugin {
             Identifier(const Identifier& copy)
                 : _length(copy._length)
             {
-                if (_length > sizeof(_id._buffer)) {
+                if (_length > maxLength) {
                     _id._allocation = new uint8_t[_length];
                     ::memcpy(_id._allocation, copy._id._allocation, _length);
                 } else {
@@ -167,7 +167,7 @@ namespace Plugin {
                 : _length(copy._length)
             {
 
-                if (_length > sizeof(_id._buffer)) {
+                if (_length > maxLength) {
                     _id._allocation = copy._id._allocation;
                 } else {
                     ::memcpy(_id._buffer, copy._id._buffer, _length);
@@ -180,14 +180,14 @@ namespace Plugin {
 
             Identifier& operator=(const Identifier& rhs)
             {
-                if (_length > sizeof(_id._buffer)) {
+                if (_length > maxLength) {
                     if (rhs._length > _length) {
                         // Reallocation required.
                         delete[] _id._allocation;
                         _length = rhs._length;
                         _id._allocation = new uint8_t[_length];
                         ::memcpy(_id._allocation, rhs._id._allocation, _length);
-                    } else if (rhs._length > sizeof(_id._buffer)) {
+                    } else if (rhs._length > maxLength) {
                         // Reuse the buffer, it wll fit..
                         _length = rhs._length;
                         ::memcpy(_id._allocation, rhs._id._allocation, _length);
@@ -197,7 +197,7 @@ namespace Plugin {
                         _length = rhs._length;
                         ::memcpy(_id._buffer, rhs._id._buffer, _length);
                     }
-                } else if (rhs._length > sizeof(_id._buffer)) {
+                } else if (rhs._length > maxLength) {
                     _length = rhs._length;
                     _id._allocation = new uint8_t[_length];
                     ::memcpy(_id._allocation, rhs._id._allocation, _length);
@@ -212,7 +212,7 @@ namespace Plugin {
         public:
             inline void Clear()
             {
-                if (_length > sizeof(_id._buffer)) {
+                if (_length > maxLength) {
                     delete[] _id._allocation;
                     _id._allocation = nullptr;
                 }
@@ -224,7 +224,7 @@ namespace Plugin {
             }
             inline const uint8_t* Id() const
             {
-                return (_length <= sizeof(_id._buffer) ? _id._buffer : _id._allocation);
+                return (_length <= maxLength ? _id._buffer : _id._allocation);
             }
             inline bool operator==(const Identifier& rhs) const
             {
@@ -240,12 +240,13 @@ namespace Plugin {
                 Core::ToHexString(Id(), _length, text);
                 return (text);
             }
-
+        public:
+            static constexpr uint16_t maxLength = 16;
         private:
             uint8_t _length;
             union {
                 uint8_t* _allocation;
-                uint8_t _buffer[16];
+                uint8_t _buffer[maxLength];
             } _id;
         };
         class Lease {
@@ -262,6 +263,12 @@ namespace Plugin {
             inline Lease(const Identifier& id, const uint32_t address)
                 : _id(id)
                 , _expiration(0)
+                , _address(address)
+            {
+            }
+            inline Lease(const Identifier& id, const uint32_t address, uint64_t expiration)
+                : _id(id)
+                , _expiration(expiration)
                 , _address(address)
             {
             }
@@ -312,6 +319,63 @@ namespace Plugin {
             {
                 _id = id;
             }
+
+        public: 
+            class JSON : public Core::JSON::Container {
+            private:
+                JSON& operator=(const JSON&) = delete;
+
+            public:
+                JSON() 
+                    : Core::JSON::Container()
+                    , ipAddress()
+                    , identifier()
+                    , expiration()
+                {
+                    Add(_T("ipAddress"), &ipAddress);
+                    Add(_T("identifier"), &identifier);
+                    Add(_T("expiration"), &expiration);
+                }
+
+                JSON(const JSON& copy) 
+                    : Core::JSON::Container()
+                    , ipAddress(copy.ipAddress)
+                    , identifier(copy.identifier)
+                    , expiration(copy.expiration) 
+                {
+                    Add(_T("ipAddress"), &ipAddress);
+                    Add(_T("identifier"), &identifier);
+                    Add(_T("expiration"), &expiration);
+                }
+            public: 
+                JSON& Set(const Lease& source)
+                {
+                    ipAddress = source.Address().HostAddress();
+                    identifier = source.Id().Text();
+                    expiration = source.Expiration();
+          
+                    return (*this);
+                }
+                
+                Lease Get() {
+                    // Convert ip to bytes
+                    in_addr ip;
+                    inet_aton(ipAddress.Value().c_str(), &ip);
+                    ip.s_addr = ntohl(ip.s_addr); // Change back to host :)
+
+                    // Convert identifier to bytes
+                    uint16_t identifierLength;
+                    uint8_t buffer[Identifier::maxLength];
+                    Core::FromHexString(identifier.Value(), buffer, identifierLength, Identifier::maxLength);
+                    Identifier identifier(buffer, identifierLength);
+
+                    return Lease(identifier, ip.s_addr, expiration);
+                }
+            public:
+                Core::JSON::String ipAddress;
+                Core::JSON::String identifier;
+                Core::JSON::DecUInt64 expiration;
+            };
 
         private:
             Identifier _id;
@@ -640,11 +704,25 @@ namespace Plugin {
             uint32_t _yiaddr;
         };
 
+        void SaveLeases() {
+            Iterator leases = Leases();
+            Core::JSON::ArrayType<Lease::JSON> leasesList;
+            while(leases.Next() && (leases.IsValid() == true)) {
+                leasesList.Add().Set(leases.Current());
+            }        
+
+            if (_leasesStorage.Create() == true) {
+                leasesList.ToFile(_leasesStorage);
+                _leasesStorage.Close();
+            } else {
+                TRACE_L1("Could not save leases in pemranent storage area.\n");
+            }
+        }
     public:
         typedef Core::LockableIteratorType<const LeaseList, const Lease&, LeaseList::const_iterator> Iterator;
 
     public:
-        DHCPServerImplementation(const string& serverName, const string& interfaceName, const uint32_t poolStart, const uint32_t poolSize, const uint32_t router, const Core::NodeId& DNS)
+        DHCPServerImplementation(const string& serverName, const string& interfaceName, const uint32_t poolStart, const uint32_t poolSize, const uint32_t router, const Core::NodeId& DNS, const string& persistentStoragePath)
             : Core::SocketDatagram(false, Core::NodeId("255.255.255.255", DefaultDHCPServerPort), Core::NodeId("255.255.255.255", DefaultDHCPClientPort), 1024, 16384)
             , _serverName(Core::ToString(serverName))
             , _interfaceName(interfaceName)
@@ -656,13 +734,37 @@ namespace Plugin {
             , _server(0)
             , _router(router)
             , _dns(~0)
+            , _persistentStoragePath(persistentStoragePath)
             , _leases()
             , _responses()
+            , _leasesStorage(persistentStoragePath + "/" + interfaceName + "_leases.json")
         {
             static_assert(sizeof(uint32_t) == 4, "Incorrect architecture chosen. uint32_t must by 4 bytes");
 
             if (DNS.IsValid() == true) {
                 _dns = ntohl(static_cast<const Core::NodeId::SocketInfo&>(DNS).IPV4Socket.sin_addr.s_addr);
+            }
+
+            // Make sure persistent storage directory exists
+            if (_persistentStoragePath.empty() == false) {
+                if (Core::Directory(_persistentStoragePath.c_str()).CreatePath() == false) {
+                    TRACE_L1("Could not create a DHCPServer persistent storage directory");
+                }
+            }
+
+            // Try to load saved leases
+            if (_leasesStorage.Exists() == true) {
+                if (_leasesStorage.Open(true) == true) {
+                    Core::JSON::ArrayType<Lease::JSON> leases;
+
+                    leases.FromFile(_leasesStorage);
+                    _leasesStorage.Close();
+
+                    auto iterator = leases.Elements();
+                    while ((iterator.Next() == true) && (iterator.IsValid() == true)) {
+                        _leases.push_back(iterator.Current().Get());
+                    }
+                }
             }
         }
         virtual ~DHCPServerImplementation()
@@ -755,7 +857,7 @@ namespace Plugin {
                         result = nullptr;
                     }
                 }
-            }
+            } 
 
             if (result == nullptr) {
                 // First look in previously unallocated IP slots
@@ -805,8 +907,8 @@ namespace Plugin {
             Lease* result = Find(scratchPad.Id());
             uint32_t serverId = scratchPad.ServerIdentifier();
             uint32_t requested = scratchPad.RequestedIP();
+            
             bool positive = ((serverId != 0) && (result != nullptr));
-
             response.Acknowledge(positive, requested);
             if (positive == true) {
                 // Set lease time
@@ -814,6 +916,7 @@ namespace Plugin {
                 leaseExp.Add(DefaultLeaseTime * (60 /* min */ * 60 * 1000));
                 response.LeaseTime(DefaultLeaseTime);
                 result->Expiration(leaseExp.Ticks());
+                SaveLeases();
             } else {
                 if (result != nullptr) {
                     result->Expiration(0); // Invalidate
@@ -924,8 +1027,10 @@ namespace Plugin {
         uint32_t _server;
         uint32_t _router;
         uint32_t _dns;
+        string _persistentStoragePath;
         LeaseList _leases;
         std::list<Core::ProxyType<Response>> _responses;
+        Core::File _leasesStorage;
 
         static Core::ProxyPoolType<Response> _responseFactory;
     };
